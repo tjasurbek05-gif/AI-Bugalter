@@ -12,7 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy import text
 
-from app.handlers.payment import handle_stripe_webhook
+from app.handlers.payment import handle_click_complete, handle_click_prepare, handle_stripe_webhook
 from app.services.cache import close_redis
 from app.services.db import engine, init_models
 from bot import create_bot, create_dispatcher, create_scheduler
@@ -100,3 +100,18 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
 
     await handle_stripe_webhook(event, request.app.state.bot)
     return {"ok": True}
+
+
+@app.post("/webhook/click")
+@limiter.limit("60/minute")
+async def click_webhook(request: Request) -> dict:
+    form = await request.form()
+    data = dict(form)
+    action = str(data.get("action"))
+
+    if action == "0":
+        return await handle_click_prepare(data)
+    if action == "1":
+        return await handle_click_complete(data, request.app.state.bot)
+
+    return {"error": -3, "error_note": "Action not found"}

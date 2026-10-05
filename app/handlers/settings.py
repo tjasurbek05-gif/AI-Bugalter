@@ -8,6 +8,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 
+from app.handlers.payment import PremiumMenuAction
+
 from app.models.category import DEFAULT_CATEGORIES, Category
 from app.services.db import get_or_create_user, get_session
 from app.utils.decorators import log_errors
@@ -37,6 +39,7 @@ HELP_TEXT = (
     "/categories — list your expense categories\n"
     "/language — change bot language\n"
     "/subscribe — see subscription plans\n"
+    "/premium — ⭐ premium (1 day / 1 week / 1 month) via Click\n"
 )
 
 
@@ -55,7 +58,9 @@ async def start(message: Message) -> None:
             first_name=message.from_user.first_name,
             language_code=message.from_user.language_code,
         )
-    await message.answer(WELCOME_TEXT)
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⭐ Premium", callback_data=PremiumMenuAction().pack()))
+    await message.answer(WELCOME_TEXT, reply_markup=builder.as_markup())
 
 
 @router.message(Command("help"))

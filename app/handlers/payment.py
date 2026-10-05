@@ -1,7 +1,10 @@
-"""Phase 4: /subscribe checkout flow + Stripe webhook handling."""
+"""Phase 4: /subscribe checkout flow + Stripe webhook handling. Also the
+Click (click.uz) Premium flow: a "Premium" button -> pick a duration -> pay.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from aiogram import Bot, Router
 from aiogram.filters import Command
@@ -11,8 +14,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 
 import stripe
+from app.models.click_transaction import CLICK_STATE_CANCELLED, CLICK_STATE_PAID, ClickTransaction
 from app.models.subscription import Subscription
 from app.models.user import User
+from app.services import click as click_service
 from app.services.db import get_or_create_user, get_session
 from app.services.stripe import (
     StripeConfigError,
@@ -76,6 +81,174 @@ async def select_tier(callback: CallbackQuery, callback_data: SubscribeAction) -
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
+
+
+class PremiumMenuAction(CallbackData, prefix="premium_menu"):
+    pass
+
+
+class PremiumPlanAction(CallbackData, prefix="premium_plan"):
+    tier: str
+
+
+def _fmt_sum(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+
+@router.message(Command("premium"))
+@log_errors
+async def premium_command(message: Message) -> None:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⭐ Premium", callback_data=PremiumMenuAction().pack()))
+    await message.answer(
+        "⭐ <b>Premium</b> — cheksiz tranzaksiyalar, AI tahlil va qarz kuzatuvi.",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(PremiumMenuAction.filter())
+@log_errors
+async def open_premium_menu(callback: CallbackQuery) -> None:
+    builder = InlineKeyboardBuilder()
+    for plan in click_service.PREMIUM_PLANS.values():
+        label = f"{plan.label} — {_fmt_sum(plan.amount)} so'm"
+        builder.row(InlineKeyboardButton(text=label, callback_data=PremiumPlanAction(tier=plan.tier).pack()))
+
+    await callback.message.answer("⭐ <b>Muddatni tanlang</b>", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(PremiumPlanAction.filter())
+@log_errors
+async def select_premium_plan(callback: CallbackQuery, callback_data: PremiumPlanAction) -> None:
+    plan = click_service.PREMIUM_PLANS.get(callback_data.tier)
+    if plan is None:
+        await callback.answer("Bu reja topilmadi.", show_alert=True)
+        return
+
+    merchant_trans_id = click_service.new_merchant_trans_id(callback.from_user.id)
+
+    async with get_session() as session:
+        user = await get_or_create_user(session, telegram_id=callback.from_user.id)
+        session.add(
+            ClickTransaction(
+                user_id=user.id,
+                merchant_trans_id=merchant_trans_id,
+                tier=plan.tier,
+                amount=plan.amount,
+            )
+        )
+        await session.commit()
+
+    try:
+        pay_url = click_service.build_pay_url(merchant_trans_id, plan.amount)
+    except click_service.ClickConfigError:
+        logger.warning("click_not_configured")
+        await callback.answer("To'lov tizimi hali sozlanmagan. Birozdan so'ng urinib ko'ring.", show_alert=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💳 Click orqali to'lash", url=pay_url))
+    await callback.message.answer(
+        f"Siz tanladingiz: {plan.label} — {_fmt_sum(plan.amount)} so'm\n"
+        "To'lovni yakunlash uchun quyidagi tugmani bosing.",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+def _click_response(data: dict, error: int, note: str, **extra: object) -> dict:
+    return {
+        "click_trans_id": data.get("click_trans_id"),
+        "merchant_trans_id": data.get("merchant_trans_id"),
+        "error": error,
+        "error_note": note,
+        **extra,
+    }
+
+
+async def handle_click_prepare(data: dict) -> dict:
+    """Click's Prepare step: validate the transaction, don't activate anything yet."""
+    if not click_service.verify_prepare_signature(data):
+        return _click_response(data, click_service.ERROR_SIGN_FAILED, "SIGN CHECK FAILED!")
+
+    merchant_trans_id = str(data.get("merchant_trans_id", ""))
+    async with get_session() as session:
+        result = await session.execute(
+            select(ClickTransaction).where(ClickTransaction.merchant_trans_id == merchant_trans_id)
+        )
+        transaction = result.scalar_one_or_none()
+        if transaction is None:
+            return _click_response(data, click_service.ERROR_TRANSACTION_NOT_FOUND, "Transaction not found")
+        if transaction.state == CLICK_STATE_PAID:
+            return _click_response(data, click_service.ERROR_ALREADY_PAID, "Already paid")
+        if Decimal(str(data.get("amount", "0"))) != transaction.amount:
+            return _click_response(data, click_service.ERROR_AMOUNT_MISMATCH, "Incorrect amount")
+
+        transaction.click_trans_id = str(data.get("click_trans_id", ""))
+        await session.commit()
+
+        return _click_response(
+            data,
+            click_service.ERROR_SUCCESS,
+            "Success",
+            merchant_prepare_id=transaction.id,
+        )
+
+
+async def handle_click_complete(data: dict, bot: Bot) -> dict:
+    """Click's Complete step: payment is final, activate the premium plan."""
+    if not click_service.verify_complete_signature(data):
+        return _click_response(data, click_service.ERROR_SIGN_FAILED, "SIGN CHECK FAILED!")
+
+    merchant_trans_id = str(data.get("merchant_trans_id", ""))
+    async with get_session() as session:
+        result = await session.execute(
+            select(ClickTransaction).where(ClickTransaction.merchant_trans_id == merchant_trans_id)
+        )
+        transaction = result.scalar_one_or_none()
+        if transaction is None:
+            return _click_response(data, click_service.ERROR_TRANSACTION_NOT_FOUND, "Transaction not found")
+        if transaction.state == CLICK_STATE_PAID:
+            return _click_response(data, click_service.ERROR_ALREADY_PAID, "Already paid")
+
+        if int(data.get("error", 0)) < 0:
+            transaction.state = CLICK_STATE_CANCELLED
+            await session.commit()
+            return _click_response(data, click_service.ERROR_TRANSACTION_CANCELLED, "Transaction cancelled")
+
+        plan = click_service.PREMIUM_PLANS.get(transaction.tier)
+        days = plan.days if plan else 1
+
+        user = await session.get(User, transaction.user_id)
+        base = (
+            user.subscription_expires_at
+            if (user.subscription_expires_at and user.subscription_expires_at > datetime.utcnow())
+            else datetime.utcnow()
+        )
+        user.subscription_tier = transaction.tier
+        user.subscription_expires_at = base + timedelta(days=days)
+        transaction.state = CLICK_STATE_PAID
+        await session.commit()
+
+        telegram_id = user.telegram_id
+        prepare_id = transaction.id
+
+    try:
+        await bot.send_message(
+            telegram_id,
+            f"🎉 Premium faollashtirildi! ({plan.label if plan else transaction.tier})\n"
+            "Cheksiz tranzaksiyalar, qarz kuzatuvi va AI tahlil endi ochiq.",
+        )
+    except Exception:  # noqa: BLE001 - webhook must still succeed even if the DM fails
+        logger.exception("click_activation_notify_failed", extra={"telegram_id": telegram_id})
+
+    return _click_response(
+        data,
+        click_service.ERROR_SUCCESS,
+        "Success",
+        merchant_confirm_id=prepare_id,
+    )
 
 
 async def handle_stripe_webhook(event: stripe.Event, bot: Bot) -> None:

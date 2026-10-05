@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     stripe_price_6_months: str = ""
     stripe_price_1_year: str = ""
 
+    # Click (click.uz)
+    click_service_id: str = ""
+    click_merchant_id: str = ""
+    click_secret_key: str = ""
+
     # Database
     database_url: str = "postgresql+asyncpg://bugalter_user:secure_password@localhost:5432/ai_bugalter"
     redis_url: str = "redis://localhost:6379/0"

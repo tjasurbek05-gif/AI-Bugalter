@@ -6,7 +6,17 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin
 
 FREE_TIER = "free"
-SUBSCRIPTION_TIERS = ("free", "1_week", "1_month", "3_months", "6_months", "1_year")
+SUBSCRIPTION_TIERS = (
+    "free",
+    "1_week",
+    "1_month",
+    "3_months",
+    "6_months",
+    "1_year",
+    "premium_1_day",
+    "premium_1_week",
+    "premium_1_month",
+)
 
 
 class User(TimestampMixin, Base):
